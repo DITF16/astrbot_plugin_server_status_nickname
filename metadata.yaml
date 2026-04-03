@@ -1,5 +1,8 @@
 name: astrbot_plugin_server_status_nickname
 description: "通过群昵称动态显示服务器状态的插件，并提供状态历史图生成"
-version: v1.1
+version: v2.0
 author: DITF16
 repo: https://github.com/DITF16/astrbot_plugin_server_status_nickname
+astrbot_version: ">=4.13.0"
+support_platforms:
+  - aiocqhttp
