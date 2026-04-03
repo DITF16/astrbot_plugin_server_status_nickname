@@ -1,0 +1,32 @@
+{
+  "mode": {
+    "description": "群组过滤模式",
+    "type": "string",
+    "options": ["whitelist", "blacklist"],
+    "labels": ["白名单模式", "黑名单模式"],
+    "default": "whitelist",
+    "hint": "白名单：仅在指定群聊中显示状态；黑名单：在除指定群聊外的所有群聊中显示状态"
+  },
+  "group_list": {
+    "description": "群组列表",
+    "type": "list",
+    "default": [],
+    "hint": "根据过滤模式填入群号。白名单模式下仅这些群生效，黑名单模式下这些群被排除",
+    "items": {
+      "type": "string"
+    }
+  },
+  "nickname_template": {
+    "description": "昵称状态文案模板",
+    "type": "string",
+    "default": "理智使用{cpu_percent}% 脑容量使用{mem_percent}%",
+    "hint": "可用变量: {cpu_percent} CPU占用%, {mem_percent} 内存占用%, {mem_used_gb} 已用内存GB, {mem_total_gb} 总内存GB, {mem_used_mb} 已用内存MB, {mem_total_mb} 总内存MB。例: CPU:{cpu_percent}% 内存:{mem_used_gb}/{mem_total_gb}GB"
+  },
+  "update_interval": {
+    "description": "定时更新间隔（分钟）",
+    "type": "float",
+    "default": 5,
+    "slider": {"min": 1, "max": 60, "step": 0.1},
+    "hint": "定时器自动更新昵称的间隔时间，建议不低于 3 分钟以避免频繁调用 API"
+  }
+}

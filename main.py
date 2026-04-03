@@ -1,232 +1,295 @@
-import sqlite3
 import psutil
 import re
 import os
-import json
 import uuid
 import asyncio
 from datetime import datetime, timedelta
-import pandas as pd
-import matplotlib
 from pathlib import Path
 
-matplotlib.use('Agg')
+import matplotlib
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import matplotlib.font_manager as fm
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
 from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.star import Context, Star, register, StarTools
+from astrbot.api.star import Context, Star, StarTools
 from astrbot.api import logger
 
+DEFAULT_TEMPLATE = "理智使用{cpu_percent}% 脑容量使用{mem_percent}%"
+ABSOLUTE_TEMPLATE = "理智使用{cpu_percent}% 脑容量使用{mem_used_gb}G/{mem_total_gb}G"
+STATUS_SUFFIX_RE = re.compile(r"\s*\([^)]+\)$")
+RECORDS_KEY = "status_records"
+MAX_RECORD_DAYS = 10
 
-@register(
-    "astrbot_plugin_server_status_nickname",
-    "DITF16",
-    "通过群昵称动态显示服务器状态的插件，并提供状态历史图生成",
-    "1.1",
-    "https://github.com/DITF16/astrbot_plugin_server_status_nickname"
-)
+
 class ServerStatusPlugin(Star):
-    def __init__(self, context: Context):
+    def __init__(self, context: Context, config=None):
         super().__init__(context)
+        self.plugin_config = config or {}
+
         self.data_dir = StarTools.get_data_dir("astrbot_plugin_server_status")
         self.data_dir.mkdir(parents=True, exist_ok=True)
-
         self.tmp_dir = self.data_dir / "tmp"
-        self.db_path = self.data_dir / "status.db"
-        self.config_path = self.data_dir / "config.json"
-        self.group_config_path = self.data_dir / "groups.txt"
+        self.tmp_dir.mkdir(exist_ok=True)
+
         self.font_dir = Path(__file__).parent / "font"
         self.font_dir.mkdir(exist_ok=True)
         self.font_path = self.font_dir / "font.ttf"
-
-        self.tmp_dir.mkdir(exist_ok=True)
-        self.scheduler = None
-        self.display_mode = "percent"
-        self.target_groups = set()
-        self.group_last_update_time = {}
         self.font_prop = None
 
-        self._init_plugin_data()
+        # UMO 追踪的群组: {group_id: {client, self_id, umo}}
+        self.tracked_groups = {}
 
-    def _init_plugin_data(self):
+        self._init_plugin()
+
+    def _init_plugin(self):
         try:
             if self.font_path.exists():
                 self.font_prop = fm.FontProperties(fname=self.font_path)
                 logger.info(f"成功加载字体文件: {self.font_path}")
             else:
-                logger.warning(f"字体文件未找到: {self.font_path}，图表中的中文可能显示为方块。")
-                logger.warning("请在插件目录中创建 /font 文件夹，并放入一个名为 font.ttf 的中文字体文件。")
+                logger.warning(
+                    f"字体文件未找到: {self.font_path}，图表中的中文可能显示为方块。"
+                )
+                logger.warning(
+                    "请在插件目录中创建 /font 文件夹，并放入 font.ttf 中文字体文件。"
+                )
 
-            self._sync_load_config()
-            logger.info(f"成功加载显示模式配置，当前模式: {self.display_mode}")
-
-            self._sync_load_groups()
-            logger.info(f"成功加载群号配置，将为 {len(self.target_groups)} 个群聊更新状态。")
-
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                cursor.execute('''
-                    CREATE TABLE IF NOT EXISTS status_records (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        timestamp DATETIME NOT NULL,
-                        cpu_percent REAL NOT NULL,
-                        memory_percent REAL NOT NULL,
-                        memory_used_mb REAL NOT NULL,
-                        memory_total_mb REAL NOT NULL
-                    )
-                ''')
-            logger.info("数据库已确认并初始化。")
-
+            interval = self._cfg("update_interval", 5)
+            if not isinstance(interval, (int, float)) or interval < 1 or interval > 60:
+                logger.warning(
+                    f"更新间隔配置值 {interval} 无效，已回退为默认值 5 分钟。"
+                )
+                interval = 5
             self.scheduler = AsyncIOScheduler(timezone="Asia/Shanghai")
-            self.scheduler.add_job(self.scheduled_db_record, 'interval', minutes=5, id='job_record_status')
-            self.scheduler.add_job(self.scheduled_db_cleanup, 'cron', hour=4, minute=0, id='job_cleanup_db')
+            self.scheduler.add_job(
+                self._scheduled_record, "interval", minutes=5, id="job_record_status"
+            )
+            self.scheduler.add_job(
+                self._scheduled_cleanup, "cron", hour=4, minute=0, id="job_cleanup_db"
+            )
+            self.scheduler.add_job(
+                self._scheduled_nickname_update,
+                "interval",
+                minutes=interval,
+                id="job_update_nickname",
+            )
             self.scheduler.start()
-            logger.info("定时任务调度器已启动。")
-
+            logger.info(f"定时任务调度器已启动，昵称更新间隔: {interval} 分钟。")
         except Exception as e:
             logger.error(f"插件初始化失败: {e}", exc_info=True)
 
-    async def get_system_stats(self) -> dict:
-        cpu_percent = psutil.cpu_percent(interval=1)
+    # ── Config helpers ──
+
+    def _cfg(self, key, default=None):
+        return self.plugin_config.get(key, default)
+
+    def _save_plugin_config(self):
+        if hasattr(self.plugin_config, "save_config"):
+            self.plugin_config.save_config()
+
+    def _is_group_allowed(self, group_id: str) -> bool:
+        mode = self._cfg("mode", "whitelist")
+        group_list = set(self._cfg("group_list", []))
+        if mode == "whitelist":
+            return group_id in group_list if group_list else True
+        return group_id not in group_list
+
+    def _format_status_text(self, stats: dict) -> str:
+        template = self._cfg("nickname_template", DEFAULT_TEMPLATE)
+        variables = {
+            "cpu_percent": f"{stats['cpu']:.1f}",
+            "mem_percent": f"{stats['mem_percent']:.1f}",
+            "mem_used_gb": f"{stats['mem_used_mb'] / 1024:.1f}",
+            "mem_total_gb": f"{stats['mem_total_mb'] / 1024:.1f}",
+            "mem_used_mb": f"{stats['mem_used_mb']:.0f}",
+            "mem_total_mb": f"{stats['mem_total_mb']:.0f}",
+        }
+        text = template
+        for k, v in variables.items():
+            text = text.replace(f"{{{k}}}", v)
+        return f"({text})"
+
+    # ── System stats ──
+
+    async def _get_system_stats(self) -> dict:
+        loop = asyncio.get_running_loop()
+        cpu = await loop.run_in_executor(None, psutil.cpu_percent, 1)
         mem = psutil.virtual_memory()
         return {
-            "cpu": cpu_percent,
+            "cpu": cpu,
             "mem_percent": mem.percent,
             "mem_used_mb": mem.used / (1024 * 1024),
-            "mem_total_mb": mem.total / (1024 * 1024)
+            "mem_total_mb": mem.total / (1024 * 1024),
         }
 
-    async def update_db(self, stats: dict):
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._sync_update_db, stats)
+    # ── KV storage for records ──
 
-    def _sync_update_db(self, stats: dict):
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "INSERT INTO status_records (timestamp, cpu_percent, memory_percent, memory_used_mb, memory_total_mb) VALUES (?, ?, ?, ?, ?)",
-                (datetime.now(), stats['cpu'], stats['mem_percent'], stats['mem_used_mb'], stats['mem_total_mb'])
-            )
-            conn.commit()
+    async def _append_record(self, stats: dict):
+        records = await self.get_kv_data(RECORDS_KEY, [])
+        records.append(
+            {
+                "ts": datetime.now().isoformat(),
+                "cpu": stats["cpu"],
+                "mem_pct": stats["mem_percent"],
+                "mem_used_mb": stats["mem_used_mb"],
+                "mem_total_mb": stats["mem_total_mb"],
+            }
+        )
+        await self.put_kv_data(RECORDS_KEY, records)
 
-    async def update_all_nicknames(self, client, self_id: int, stats: dict):
-        if not self.target_groups:
-            return
-        update_tasks = [self.update_nickname_for_group(client, group_id, self_id, stats) for group_id in
-                        self.target_groups]
-        await asyncio.gather(*update_tasks)
+    async def _query_records(
+        self, start: datetime, end: datetime, field: str
+    ) -> list[tuple[datetime, float]]:
+        records = await self.get_kv_data(RECORDS_KEY, [])
+        result = []
+        for r in records:
+            try:
+                ts = datetime.fromisoformat(r["ts"])
+            except (ValueError, KeyError):
+                continue
+            if start <= ts <= end:
+                val = r.get(field)
+                if val is not None:
+                    result.append((ts, float(val)))
+        result.sort(key=lambda x: x[0])
+        return result
 
-    async def update_nickname_for_group(self, client, group_id: str, self_id: int, stats: dict):
-        if self.display_mode == 'percent':
-            status_text = f"(理智使用{stats['cpu']:.1f}% 脑容量使用{stats['mem_percent']:.1f}%)"
-        else:
-            mem_used_gb = stats['mem_used_mb'] / 1024
-            mem_total_gb = stats['mem_total_mb'] / 1024
-            status_text = f"(理智使用{stats['cpu']:.1f}% 脑容量使用{mem_used_gb:.1f}G/{mem_total_gb:.1f}G)"
+    async def _cleanup_old_records(self):
+        records = await self.get_kv_data(RECORDS_KEY, [])
+        cutoff = datetime.now() - timedelta(days=MAX_RECORD_DAYS)
+        kept = []
+        for r in records:
+            try:
+                ts = datetime.fromisoformat(r["ts"])
+                if ts >= cutoff:
+                    kept.append(r)
+            except (ValueError, KeyError):
+                continue
+        await self.put_kv_data(RECORDS_KEY, kept)
+        removed = len(records) - len(kept)
+        if removed:
+            logger.info(f"清理了 {removed} 条过期记录。")
 
+    # ── Nickname management ──
+
+    async def _update_nickname(self, client, group_id: str, self_id: int, stats: dict):
+        status_text = self._format_status_text(stats)
         try:
-            info_payload = {"group_id": int(group_id), "user_id": self_id}
-            member_info = await client.api.call_action('get_group_member_info', **info_payload)
-            current_card = member_info.get('card', '')
+            info = await client.api.call_action(
+                "get_group_member_info", group_id=int(group_id), user_id=self_id
+            )
+            current_card = info.get("card", "")
 
-            match = re.search(r"(\s*\(理智使用.*?\s*脑容量使用.*?\))$", current_card)
-            if match:
-                base_name = current_card[:match.start()].rstrip()
-                new_card = f"{base_name} {status_text}" if base_name else status_text
-            else:
-                new_card = f"{current_card} {status_text}".lstrip()
+            match = STATUS_SUFFIX_RE.search(current_card)
+            base_name = (
+                current_card[: match.start()].rstrip() if match else current_card
+            )
+            new_card = f"{base_name} {status_text}" if base_name else status_text
 
             if new_card == current_card:
                 return
 
-            set_payload = {"group_id": int(group_id), "user_id": self_id, "card": new_card}
-
-            max_retries = 3
-            for i in range(max_retries):
+            for i in range(3):
                 try:
-                    await client.api.call_action('set_group_card', **set_payload)
-                    logger.info(f"成功更新群 {group_id} 的昵称为: {new_card}")
+                    await client.api.call_action(
+                        "set_group_card",
+                        group_id=int(group_id),
+                        user_id=self_id,
+                        card=new_card,
+                    )
+                    logger.info(f"更新群 {group_id} 昵称: {new_card}")
                     break
                 except Exception as e:
-                    logger.warning(f"更新群 {group_id} 昵称失败 (第 {i + 1} 次尝试): {e}")
-                    if i == max_retries - 1:
-                        logger.error(f"更新群 {group_id} 昵称在 {max_retries} 次重试后彻底失败。")
+                    if i == 2:
+                        logger.error(f"更新群 {group_id} 昵称失败: {e}")
                     await asyncio.sleep(1)
-
         except Exception as e:
-            logger.error(f"处理群 {group_id} 昵称更新时发生错误: {e}")
+            logger.error(f"更新群 {group_id} 昵称出错: {e}")
 
-    async def cleanup_nickname_suffix(self, client, group_id: str, self_id: int):
-        """检查并清理非目标群聊的昵称后缀"""
+    async def _cleanup_nickname(self, client, group_id: str, self_id: int):
         try:
-            info_payload = {"group_id": int(group_id), "user_id": self_id}
-            member_info = await client.api.call_action('get_group_member_info', **info_payload)
-            current_card = member_info.get('card', '')
-
-            if not current_card:
+            info = await client.api.call_action(
+                "get_group_member_info", group_id=int(group_id), user_id=self_id
+            )
+            card = info.get("card", "")
+            if not card:
                 return
-
-            match = re.search(r"(\s*\(理智使用.*?\s*脑容量使用.*?\))$", current_card)
+            match = STATUS_SUFFIX_RE.search(card)
             if match:
-                new_card = current_card[:match.start()].rstrip()
-                if new_card == current_card:
-                    return
-                set_payload = {"group_id": int(group_id), "user_id": self_id, "card": new_card}
-                await client.api.call_action('set_group_card', **set_payload)
-                logger.info(f"成功为非目标群 {group_id} 清理了昵称后缀。")
+                new_card = card[: match.start()].rstrip()
+                if new_card != card:
+                    await client.api.call_action(
+                        "set_group_card",
+                        group_id=int(group_id),
+                        user_id=self_id,
+                        card=new_card,
+                    )
+                    logger.info(f"已清理群 {group_id} 昵称后缀。")
         except Exception as e:
-            logger.error(f"为群 {group_id} 清理昵称时发生错误: {e}")
+            logger.error(f"清理群 {group_id} 昵称出错: {e}")
 
-    async def scheduled_db_record(self):
-        logger.info("执行定时数据库记录...")
-        stats = await self.get_system_stats()
-        await self.update_db(stats)
+    # ── Scheduled tasks ──
+
+    async def _scheduled_record(self):
+        stats = await self._get_system_stats()
+        await self._append_record(stats)
+
+    async def _scheduled_cleanup(self):
+        await self._cleanup_old_records()
+
+    async def _scheduled_nickname_update(self):
+        if not self.tracked_groups:
+            return
+        stats = await self._get_system_stats()
+        semaphore = asyncio.Semaphore(5)
+
+        async def update_one(gid: str, info: dict):
+            async with semaphore:
+                if self._is_group_allowed(gid):
+                    await self._update_nickname(
+                        info["client"], gid, info["self_id"], stats
+                    )
+                else:
+                    await self._cleanup_nickname(info["client"], gid, info["self_id"])
+
+        await asyncio.gather(
+            *(update_one(gid, info) for gid, info in list(self.tracked_groups.items()))
+        )
+
+    # ── Event handlers ──
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
-    async def update_on_message(self, event: AstrMessageEvent):
+    async def on_group_message(self, event: AstrMessageEvent):
+        """收到群消息时注册群组，后续由定时器自动更新。"""
         client = self._get_client_from_event(event)
         if not client:
             return
-
         try:
             self_id = int(event.message_obj.self_id)
         except (AttributeError, ValueError):
-            logger.error("无法从事件中获取有效的机器人自身ID (self_id)。")
             return
 
         group_id = event.get_group_id()
-
-        now = datetime.now()
-        last_update = self.group_last_update_time.get(group_id)
-        if last_update and (now - last_update) < timedelta(minutes=5):
+        if not group_id:
             return
 
-        logger.info(f"群 {group_id} 消息触发状态更新检查 (冷却时间已过)。")
-        self.group_last_update_time[group_id] = now
-
-        stats = await self.get_system_stats()
-
-        if group_id in self.target_groups:
-            await self.update_nickname_for_group(client, group_id, self_id, stats)
+        if group_id not in self.tracked_groups:
+            umo = getattr(event, "unified_msg_origin", None)
+            self.tracked_groups[group_id] = {
+                "client": client,
+                "self_id": self_id,
+                "umo": umo,
+            }
+            logger.info(f"已注册群 {group_id} (UMO: {umo})，定时器将自动更新昵称。")
         else:
-            await self.cleanup_nickname_suffix(client, group_id, self_id)
+            self.tracked_groups[group_id]["client"] = client
+            self.tracked_groups[group_id]["self_id"] = self_id
 
-    async def scheduled_db_cleanup(self):
-        try:
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, self._sync_db_cleanup)
-            logger.info("成功清理了10天前的旧数据。")
-        except Exception as e:
-            logger.error(f"数据库清理失败: {e}")
-
-    def _sync_db_cleanup(self):
-        ten_days_ago = datetime.now() - timedelta(days=10)
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute("DELETE FROM status_records WHERE timestamp < ?", (ten_days_ago,))
-            conn.commit()
+    # ── Commands ──
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("昵称显示开启")
@@ -235,25 +298,43 @@ class ServerStatusPlugin(Star):
             yield event.plain_result(f"错误：'{group_id}' 不是有效的群号。")
             return
 
-        if group_id in self.target_groups:
-            yield event.plain_result(f"群 {group_id} 已在昵称显示列表中，无需重复添加。")
-            return
+        mode = self._cfg("mode", "whitelist")
+        group_list = list(self._cfg("group_list", []))
 
-        self.target_groups.add(group_id)
-        await self._save_groups()
-        logger.info(f"用户 {event.get_sender_id()} 添加了群 {group_id} 到昵称显示列表。")
+        if mode == "blacklist":
+            # 黑名单模式：开启 = 从排除列表移除
+            if group_id in group_list:
+                group_list.remove(group_id)
+                self.plugin_config["group_list"] = group_list
+                self._save_plugin_config()
+            else:
+                yield event.plain_result(f"群 {group_id} 未被排除，无需操作。")
+                return
+        else:
+            # 白名单模式：开启 = 加入列表
+            if group_id in group_list:
+                yield event.plain_result(f"群 {group_id} 已在列表中。")
+                return
+            group_list.append(group_id)
+            self.plugin_config["group_list"] = group_list
+            self._save_plugin_config()
 
         client = self._get_client_from_event(event)
         if client:
             try:
                 self_id = int(event.message_obj.self_id)
-                stats = await self.get_system_stats()
-                await self.update_nickname_for_group(client, group_id, self_id, stats)
-                yield event.plain_result(f"成功开启！已将群 {group_id} 加入昵称显示列表并立即更新昵称。")
+                self.tracked_groups[group_id] = {
+                    "client": client,
+                    "self_id": self_id,
+                    "umo": None,
+                }
+                stats = await self._get_system_stats()
+                await self._update_nickname(client, group_id, self_id, stats)
+                yield event.plain_result(f"已开启群 {group_id} 的状态显示。")
             except (AttributeError, ValueError):
-                yield event.plain_result(f"成功开启！已将群 {group_id} 加入昵称显示列表但无法获取机器人ID立即更新。")
+                yield event.plain_result(f"已开启群 {group_id}，但无法立即更新昵称。")
         else:
-            yield event.plain_result(f"成功开启！已将群 {group_id} 加入昵称显示列表。")
+            yield event.plain_result(f"已开启群 {group_id} 的状态显示。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("昵称显示关闭")
@@ -262,51 +343,61 @@ class ServerStatusPlugin(Star):
             yield event.plain_result(f"错误：'{group_id}' 不是有效的群号。")
             return
 
-        if group_id not in self.target_groups:
-            yield event.plain_result(f"群 {group_id} 不在昵称显示列表中。")
-            return
+        mode = self._cfg("mode", "whitelist")
+        group_list = list(self._cfg("group_list", []))
 
-        self.target_groups.remove(group_id)
-        await self._save_groups()
-        logger.info(f"用户 {event.get_sender_id()} 从昵称显示列表移除了群 {group_id}。")
+        if mode == "blacklist":
+            # 黑名单模式：关闭 = 加入排除列表
+            if group_id in group_list:
+                yield event.plain_result(f"群 {group_id} 已在排除列表中。")
+                return
+            group_list.append(group_id)
+            self.plugin_config["group_list"] = group_list
+            self._save_plugin_config()
+        else:
+            # 白名单模式：关闭 = 从列表移除
+            if group_id not in group_list:
+                yield event.plain_result(f"群 {group_id} 不在列表中。")
+                return
+            group_list.remove(group_id)
+            self.plugin_config["group_list"] = group_list
+            self._save_plugin_config()
+
+        # 从 tracked_groups 移除，避免定时器继续无效调用
+        self.tracked_groups.pop(group_id, None)
 
         client = self._get_client_from_event(event)
         if client:
             try:
                 self_id = int(event.message_obj.self_id)
-                await self.cleanup_nickname_suffix(client, group_id, self_id)
-                yield event.plain_result(f"操作成功！已将群 {group_id} 从昵称显示列表移除并立即清理昵称。")
+                await self._cleanup_nickname(client, group_id, self_id)
+                yield event.plain_result(f"已关闭群 {group_id} 的状态显示并清理昵称。")
             except (AttributeError, ValueError):
-                yield event.plain_result(f"操作成功！已将群 {group_id} 从昵称显示列表移除但无法获取机器人ID立即清理。")
+                yield event.plain_result(f"已关闭群 {group_id} 的状态显示。")
         else:
-            yield event.plain_result(f"操作成功！已将群 {group_id} 从昵称显示列表移除。")
-
+            yield event.plain_result(f"已关闭群 {group_id} 的状态显示。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("刷新缓存")
     async def brain_refresh(self, event: AstrMessageEvent):
-        """重新从文件加载配置并刷新当前群聊状态"""
-        logger.info(f"用户 {event.get_sender_id()} 触发了'刷新缓存'指令。")
-        await self._load_config()
-        await self._load_groups()
-
-        reply_msg = "缓存刷新成功！已重新加载群列表和显示配置。"
-
         client = self._get_client_from_event(event)
         group_id = event.get_group_id()
+        reply = "已刷新配置。"
+
         if client and group_id:
             try:
                 self_id = int(event.message_obj.self_id)
-                stats = await self.get_system_stats()
-                if group_id in self.target_groups:
-                    await self.update_nickname_for_group(client, group_id, self_id, stats)
+                stats = await self._get_system_stats()
+                if self._is_group_allowed(group_id):
+                    await self._update_nickname(client, group_id, self_id, stats)
+                    reply += "\n并已刷新当前群聊的昵称状态。"
                 else:
-                    await self.cleanup_nickname_suffix(client, group_id, self_id)
-                reply_msg += "\n并已刷新当前群聊的昵称状态。"
+                    await self._cleanup_nickname(client, group_id, self_id)
+                    reply += "\n当前群聊不在生效列表中，已清理昵称。"
             except (AttributeError, ValueError):
-                reply_msg += "\n但无法获取机器人ID以刷新当前群聊昵称。"
+                pass
 
-        yield event.plain_result(reply_msg)
+        yield event.plain_result(reply)
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("服务器更新")
@@ -315,19 +406,40 @@ class ServerStatusPlugin(Star):
         if not client:
             yield event.plain_result("错误：当前平台不支持或无法获取客户端。")
             return
-
         try:
-            self_id = int(event.message_obj.self_id)
+            int(event.message_obj.self_id)
         except (AttributeError, ValueError):
-            logger.error("无法从事件中获取有效的机器人自身ID (self_id)。")
             yield event.plain_result("错误：无法获取机器人自身ID。")
             return
 
-        logger.info(f"用户 {event.get_sender_id()} 触发了'服务器更新'指令。")
-        stats = await self.get_system_stats()
-        await self.update_db(stats)
-        await self.update_all_nicknames(client, self_id, stats)
-        yield event.plain_result("服务器更新成功！已为所有受监控的群聊刷新昵称状态。")
+        stats = await self._get_system_stats()
+        await self._append_record(stats)
+        await self._scheduled_nickname_update()
+        yield event.plain_result("已更新所有受监控群聊的昵称状态。")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("改变脑容量显示")
+    async def toggle_display(self, event: AstrMessageEvent):
+        current = self._cfg("nickname_template", DEFAULT_TEMPLATE)
+        if current == DEFAULT_TEMPLATE:
+            self.plugin_config["nickname_template"] = ABSOLUTE_TEMPLATE
+            reply = "已切换为绝对值模式 (G/G)。"
+        else:
+            self.plugin_config["nickname_template"] = DEFAULT_TEMPLATE
+            reply = "已切换为百分比模式 (%)。"
+        self._save_plugin_config()
+
+        client = self._get_client_from_event(event)
+        group_id = event.get_group_id()
+        if client and group_id:
+            try:
+                self_id = int(event.message_obj.self_id)
+                stats = await self._get_system_stats()
+                await self._update_nickname(client, group_id, self_id, stats)
+            except (AttributeError, ValueError):
+                pass
+
+        yield event.plain_result(reply)
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("理智记录")
@@ -336,38 +448,37 @@ class ServerStatusPlugin(Star):
         try:
             delta = self._parse_time_arg(time_str)
             if delta is None:
-                yield event.plain_result("格式错误！请使用 'n天' 或 'n小时'，例如: /理智记录 2天")
+                yield event.plain_result(
+                    "格式错误！请使用 'n天' 或 'n小时'，例如: /理智记录 2天"
+                )
                 return
 
             end_time = datetime.now()
             start_time = end_time - delta
+            data = await self._query_records(start_time, end_time, "cpu")
 
-            loop = asyncio.get_running_loop()
-            query = f"SELECT timestamp, cpu_percent FROM status_records WHERE timestamp BETWEEN '{start_time}' AND '{end_time}'"
-
-            df = await loop.run_in_executor(None, self._sync_read_from_db, query)
-
-            if df.empty:
+            if not data:
                 yield event.plain_result(f"最近 {time_str} 内没有理智记录。")
                 return
 
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
-
+            timestamps, values = zip(*data)
             image_path = self._plot_graph(
-                df, 'timestamp', 'cpu_percent',
-                f'最近 {time_str} 理智使用记录 (CPU %)', 'CPU 占用 (%)'
+                timestamps,
+                values,
+                f"最近 {time_str} 理智使用记录 (CPU %)",
+                "CPU 占用 (%)",
             )
             yield event.image_result(str(image_path))
 
         except Exception as e:
-            logger.error(f"处理理智记录指令失败: {e}", exc_info=True)
+            logger.error(f"理智记录指令失败: {e}", exc_info=True)
             yield event.plain_result("生成图表时发生内部错误。")
         finally:
             if image_path and os.path.exists(image_path):
                 try:
                     os.remove(image_path)
-                except OSError as e:
-                    logger.error(f"删除临时图片失败: {e}")
+                except OSError:
+                    pass
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("脑容量记录")
@@ -376,98 +487,66 @@ class ServerStatusPlugin(Star):
         try:
             delta = self._parse_time_arg(time_str)
             if delta is None:
-                yield event.plain_result("格式错误！请使用 'n天' 或 'n小时'，例如: /脑容量记录 12小时")
+                yield event.plain_result(
+                    "格式错误！请使用 'n天' 或 'n小时'，例如: /脑容量记录 12小时"
+                )
                 return
 
             end_time = datetime.now()
             start_time = end_time - delta
+            data = await self._query_records(start_time, end_time, "mem_pct")
 
-            loop = asyncio.get_running_loop()
-            query = f"SELECT timestamp, memory_percent FROM status_records WHERE timestamp BETWEEN '{start_time}' AND '{end_time}'"
-
-            df = await loop.run_in_executor(None, self._sync_read_from_db, query)
-
-            if df.empty:
+            if not data:
                 yield event.plain_result(f"最近 {time_str} 内没有脑容量记录。")
                 return
 
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
-
+            timestamps, values = zip(*data)
             image_path = self._plot_graph(
-                df, 'timestamp', 'memory_percent',
-                f'最近 {time_str} 脑容量使用记录 (内存 %)', '内存占用 (%)'
+                timestamps,
+                values,
+                f"最近 {time_str} 脑容量使用记录 (内存 %)",
+                "内存占用 (%)",
             )
             yield event.image_result(str(image_path))
 
         except Exception as e:
-            logger.error(f"处理脑容量记录指令失败: {e}", exc_info=True)
+            logger.error(f"脑容量记录指令失败: {e}", exc_info=True)
             yield event.plain_result("生成图表时发生内部错误。")
         finally:
             if image_path and os.path.exists(image_path):
                 try:
                     os.remove(image_path)
-                except OSError as e:
-                    logger.error(f"删除临时图片失败: {e}")
+                except OSError:
+                    pass
 
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.command("改变脑容量显示")
-    async def toggle_display_mode(self, event: AstrMessageEvent):
-        if self.display_mode == 'percent':
-            self.display_mode = 'absolute'
-            reply_text = "脑容量显示方式已切换为：绝对值 (G/G)。"
-        else:
-            self.display_mode = 'percent'
-            reply_text = "脑容量显示方式已切换为：百分比 (%)。"
-
-        await self._save_config()
-        logger.info(f"显示模式已切换为 {self.display_mode} 并已保存。")
-
-        stats = await self.get_system_stats()
-
-        client = self._get_client_from_event(event)
-        group_id = event.get_group_id()
-
-        if client and group_id:
-            try:
-                self_id = int(event.message_obj.self_id)
-                await self.update_nickname_for_group(client, group_id, self_id, stats)
-            except (AttributeError, ValueError):
-                logger.error("无法在'改变脑容量显示'中获取有效的机器人自身ID (self_id)。")
-
-        yield event.plain_result(reply_text)
+    # ── Helpers ──
 
     def _get_client_from_event(self, event: AstrMessageEvent):
-        """安全地从事件中获取 aiocqhttp 平台的客户端对象。"""
         if event.get_platform_name() == "aiocqhttp":
             try:
-                from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
+                from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
+                    AiocqhttpMessageEvent,
+                )
+
                 if isinstance(event, AiocqhttpMessageEvent):
                     return event.bot
-                else:
-                    logger.warning("Event platform is aiocqhttp, but event is not of type AiocqhttpMessageEvent.")
-                    return None
             except ImportError:
-                logger.error("无法导入 AiocqhttpMessageEvent。请确认已正确安装 aiocqhttp 平台适配。")
-                return None
+                logger.error("无法导入 AiocqhttpMessageEvent。")
         return None
 
     def _parse_time_arg(self, time_str: str) -> timedelta | None:
-        match = re.match(r"(\d+)\s*(天|小时)", time_str)
-        if not match:
+        m = re.match(r"(\d+)\s*(天|小时)", time_str)
+        if not m:
             return None
-        num = int(match.group(1))
-        unit = match.group(2)
-        if unit == "天":
-            return timedelta(days=num)
-        elif unit == "小时":
-            return timedelta(hours=num)
-        return None
+        n, unit = int(m.group(1)), m.group(2)
+        return timedelta(days=n) if unit == "天" else timedelta(hours=n)
 
-    def _plot_graph(self, df: pd.DataFrame, x_col: str, y_col: str, title: str, ylabel: str) -> str:
-        plt.style.use('seaborn-v0_8-darkgrid')
+    def _plot_graph(self, timestamps, values, title: str, ylabel: str) -> str:
+        plt.style.use("seaborn-v0_8-darkgrid")
         fig, ax = plt.subplots(figsize=(12, 6), dpi=100)
-
-        ax.plot(df[x_col], df[y_col], marker='o', linestyle='-', markersize=3, label=ylabel)
+        ax.plot(
+            timestamps, values, marker="o", linestyle="-", markersize=3, label=ylabel
+        )
 
         if self.font_prop:
             ax.set_title(title, fontsize=16, fontproperties=self.font_prop)
@@ -481,74 +560,17 @@ class ServerStatusPlugin(Star):
             ax.legend()
 
         ax.grid(True)
-        ax.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H:%M'))
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M"))
         fig.autofmt_xdate()
-
         plt.tight_layout()
 
-        filename = f"{uuid.uuid4()}.png"
-        filepath = self.tmp_dir / filename
-        plt.savefig(filepath, format='png')
+        filepath = self.tmp_dir / f"{uuid.uuid4()}.png"
+        plt.savefig(filepath, format="png")
         plt.close(fig)
-
         return str(filepath)
-
-    def _sync_read_from_db(self, query: str) -> pd.DataFrame:
-        with sqlite3.connect(self.db_path) as conn:
-            df = pd.read_sql_query(query, conn)
-            return df
-
-    async def _load_groups(self):
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._sync_load_groups)
-
-    async def _load_config(self):
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._sync_load_config)
-
-    def _sync_load_groups(self):
-        try:
-            if self.group_config_path.exists():
-                with open(self.group_config_path, 'r', encoding='utf-8') as f:
-                    self.target_groups = {line.strip() for line in f if line.strip().isdigit()}
-        except Exception as e:
-            logger.error(f"加载群号文件 '{self.group_config_path}' 失败: {e}", exc_info=True)
-
-    async def _save_groups(self):
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._sync_save_groups)
-
-    def _sync_save_groups(self):
-        try:
-            with open(self.group_config_path, 'w', encoding='utf-8') as f:
-                for group_id in sorted(list(self.target_groups)):
-                    f.write(f"{group_id}\n")
-        except Exception as e:
-            logger.error(f"保存群号文件 '{self.group_config_path}' 失败: {e}", exc_info=True)
-
-    def _sync_load_config(self):
-        try:
-            if self.config_path.exists():
-                with open(self.config_path, 'r', encoding='utf-8') as f:
-                    config = json.load(f)
-                    self.display_mode = config.get('display_mode', 'percent')
-        except Exception as e:
-            logger.warning(f"加载配置文件失败: {e}，将使用默认配置。")
-
-    async def _save_config(self):
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._sync_save_config)
-
-    def _sync_save_config(self):
-        try:
-            with open(self.config_path, 'w', encoding='utf-8') as f:
-                json.dump({'display_mode': self.display_mode}, f)
-        except Exception as e:
-            logger.error(f"保存配置文件失败: {e}")
 
     async def terminate(self):
         logger.info("正在关闭 ServerStatus 插件...")
         if self.scheduler and self.scheduler.running:
             self.scheduler.shutdown()
-            logger.info("定时任务调度器已关闭。")
-        logger.info("ServerStatus 插件已成功关闭。")
+        logger.info("ServerStatus 插件已关闭。")
