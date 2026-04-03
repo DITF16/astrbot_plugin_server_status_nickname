@@ -15,7 +15,7 @@ import matplotlib.font_manager as fm
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.star import Context, Star, register, StarTools
+from astrbot.api.star import Context, Star, StarTools
 from astrbot.api import logger
 
 DEFAULT_TEMPLATE = "理智使用{cpu_percent}% 脑容量使用{mem_percent}%"
@@ -25,13 +25,6 @@ RECORDS_KEY = "status_records"
 MAX_RECORD_DAYS = 10
 
 
-@register(
-    "astrbot_plugin_server_status_nickname",
-    "DITF16",
-    "通过群昵称动态显示服务器状态的插件，并提供状态历史图生成",
-    "2.0",
-    "https://github.com/DITF16/astrbot_plugin_server_status_nickname",
-)
 class ServerStatusPlugin(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context)
@@ -123,7 +116,8 @@ class ServerStatusPlugin(Star):
     # ── System stats ──
 
     async def _get_system_stats(self) -> dict:
-        cpu = psutil.cpu_percent(interval=1)
+        loop = asyncio.get_running_loop()
+        cpu = await loop.run_in_executor(None, psutil.cpu_percent, 1)
         mem = psutil.virtual_memory()
         return {
             "cpu": cpu,
@@ -251,11 +245,20 @@ class ServerStatusPlugin(Star):
         if not self.tracked_groups:
             return
         stats = await self._get_system_stats()
-        for gid, info in list(self.tracked_groups.items()):
-            if self._is_group_allowed(gid):
-                await self._update_nickname(info["client"], gid, info["self_id"], stats)
-            else:
-                await self._cleanup_nickname(info["client"], gid, info["self_id"])
+        semaphore = asyncio.Semaphore(5)
+
+        async def update_one(gid: str, info: dict):
+            async with semaphore:
+                if self._is_group_allowed(gid):
+                    await self._update_nickname(
+                        info["client"], gid, info["self_id"], stats
+                    )
+                else:
+                    await self._cleanup_nickname(info["client"], gid, info["self_id"])
+
+        await asyncio.gather(
+            *(update_one(gid, info) for gid, info in list(self.tracked_groups.items()))
+        )
 
     # ── Event handlers ──
 
@@ -295,14 +298,26 @@ class ServerStatusPlugin(Star):
             yield event.plain_result(f"错误：'{group_id}' 不是有效的群号。")
             return
 
+        mode = self._cfg("mode", "whitelist")
         group_list = list(self._cfg("group_list", []))
-        if group_id in group_list:
-            yield event.plain_result(f"群 {group_id} 已在列表中。")
-            return
 
-        group_list.append(group_id)
-        self.plugin_config["group_list"] = group_list
-        self._save_plugin_config()
+        if mode == "blacklist":
+            # 黑名单模式：开启 = 从排除列表移除
+            if group_id in group_list:
+                group_list.remove(group_id)
+                self.plugin_config["group_list"] = group_list
+                self._save_plugin_config()
+            else:
+                yield event.plain_result(f"群 {group_id} 未被排除，无需操作。")
+                return
+        else:
+            # 白名单模式：开启 = 加入列表
+            if group_id in group_list:
+                yield event.plain_result(f"群 {group_id} 已在列表中。")
+                return
+            group_list.append(group_id)
+            self.plugin_config["group_list"] = group_list
+            self._save_plugin_config()
 
         client = self._get_client_from_event(event)
         if client:
@@ -315,13 +330,11 @@ class ServerStatusPlugin(Star):
                 }
                 stats = await self._get_system_stats()
                 await self._update_nickname(client, group_id, self_id, stats)
-                yield event.plain_result(f"已将群 {group_id} 加入列表并立即更新昵称。")
+                yield event.plain_result(f"已开启群 {group_id} 的状态显示。")
             except (AttributeError, ValueError):
-                yield event.plain_result(
-                    f"已将群 {group_id} 加入列表，但无法立即更新昵称。"
-                )
+                yield event.plain_result(f"已开启群 {group_id}，但无法立即更新昵称。")
         else:
-            yield event.plain_result(f"已将群 {group_id} 加入列表。")
+            yield event.plain_result(f"已开启群 {group_id} 的状态显示。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("昵称显示关闭")
@@ -330,25 +343,39 @@ class ServerStatusPlugin(Star):
             yield event.plain_result(f"错误：'{group_id}' 不是有效的群号。")
             return
 
+        mode = self._cfg("mode", "whitelist")
         group_list = list(self._cfg("group_list", []))
-        if group_id not in group_list:
-            yield event.plain_result(f"群 {group_id} 不在列表中。")
-            return
 
-        group_list.remove(group_id)
-        self.plugin_config["group_list"] = group_list
-        self._save_plugin_config()
+        if mode == "blacklist":
+            # 黑名单模式：关闭 = 加入排除列表
+            if group_id in group_list:
+                yield event.plain_result(f"群 {group_id} 已在排除列表中。")
+                return
+            group_list.append(group_id)
+            self.plugin_config["group_list"] = group_list
+            self._save_plugin_config()
+        else:
+            # 白名单模式：关闭 = 从列表移除
+            if group_id not in group_list:
+                yield event.plain_result(f"群 {group_id} 不在列表中。")
+                return
+            group_list.remove(group_id)
+            self.plugin_config["group_list"] = group_list
+            self._save_plugin_config()
+
+        # 从 tracked_groups 移除，避免定时器继续无效调用
+        self.tracked_groups.pop(group_id, None)
 
         client = self._get_client_from_event(event)
         if client:
             try:
                 self_id = int(event.message_obj.self_id)
                 await self._cleanup_nickname(client, group_id, self_id)
-                yield event.plain_result(f"已将群 {group_id} 从列表移除并清理昵称。")
+                yield event.plain_result(f"已关闭群 {group_id} 的状态显示并清理昵称。")
             except (AttributeError, ValueError):
-                yield event.plain_result(f"已将群 {group_id} 从列表移除。")
+                yield event.plain_result(f"已关闭群 {group_id} 的状态显示。")
         else:
-            yield event.plain_result(f"已将群 {group_id} 从列表移除。")
+            yield event.plain_result(f"已关闭群 {group_id} 的状态显示。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("刷新缓存")
